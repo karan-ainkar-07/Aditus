@@ -1,0 +1,152 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AccountStatus {
+  PENDING_ACTIVATION
+  ACTIVE
+  SUSPENDED
+}
+
+enum GlobalRole {
+  SYSTEM_ADMIN
+  PATIENT
+}
+
+enum ClinicRole {
+  CLINIC_ADMIN
+  DOCTOR
+  ATTENDANT
+}
+
+enum ClinicStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  REMOVED
+}
+
+model User {
+  id           String        @id @default(uuid()) @db.Uuid
+  phone        String        @unique @db.VarChar(20)
+  passwordHash String?       @db.VarChar(255)
+  status       AccountStatus @default(PENDING_ACTIVATION)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  userRoles         UserRole[]
+  clinicMemberships ClinicMembership[]
+  doctor            Doctor?
+  attendant         Attendant?
+  patient           Patient?
+  refreshTokens     RefreshToken[]
+  auditLogs         AuditLog[] @relation("AuditActor")
+
+  @@index([status])
+}
+
+model UserRole {
+  userId     String     @db.Uuid
+  role       GlobalRole
+  assignedAt DateTime   @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@id([userId, role])
+  @@index([role])
+}
+
+model Clinic {
+  id        String       @id @default(uuid()) @db.Uuid
+  status    ClinicStatus @default(PENDING)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  memberships ClinicMembership[]
+  auditLogs   AuditLog[]
+}
+
+model ClinicMembership {
+  userId    String           @db.Uuid
+  clinicId  String           @db.Uuid
+  role      ClinicRole
+  status    MembershipStatus @default(ACTIVE)
+  createdAt DateTime         @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+
+  @@id([userId, clinicId, role])
+  @@index([clinicId])
+  @@index([userId, status])
+  @@index([clinicId, role, status])
+}
+
+model Doctor {
+  userId        String  @id @db.Uuid
+  licenseNumber String? @unique @db.VarChar(100)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+}
+
+model Attendant {
+  userId String @id @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+}
+
+model Patient {
+  userId String @id @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+}
+
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  familyId     String    @db.Uuid
+  tokenHash    String    @unique @db.VarChar(64)
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?   @unique @db.Uuid
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+  deviceInfo   String?   @db.VarChar(500)
+  ipAddress    String?   @db.VarChar(45)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  replacedBy  RefreshToken?  @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: Restrict)
+  replacements RefreshToken[] @relation("TokenRotation")
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @db.Uuid
+  clinicId  String?  @db.Uuid
+  action    String   @db.VarChar(100)
+  target    String?  @db.VarChar(255)
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  actor  User?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: Restrict)
+  clinic Clinic? @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+
+  @@index([actorId, createdAt])
+  @@index([clinicId, createdAt])
+  @@index([action, createdAt])
+}
