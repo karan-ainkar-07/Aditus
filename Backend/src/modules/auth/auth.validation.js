@@ -1,4 +1,3 @@
-
 import { z } from "zod";
 
 const phoneSchema = z
@@ -7,7 +6,13 @@ const phoneSchema = z
 
 export const registerSchema = z.object({
   phone: phoneSchema,
-  password: z.string().min(8).max(72),
+  password: z
+    .string()
+    .min(8)
+    .refine(
+      (v) => Buffer.byteLength(v, "utf8") <= 72,
+      "Password is too long"
+    ),
 });
 
 export const verifyOtpSchema = z.object({
@@ -22,10 +27,6 @@ export const resendOtpSchema = z.object({
 export const loginSchema = z.object({
   phone: phoneSchema,
   password: z.string().min(1).max(72),
-});
-
-export const refreshSchema = z.object({
-  refreshToken: z.string().min(32).max(512),
 });
 
 export const validate = (schema) => (req, res, next) => {

@@ -19,6 +19,25 @@ const refreshToken = {
   ttlSeconds: 30 * 24 * 60 * 60, 
 };
 
+const isProd = process.env.NODE_ENV === "production";
+
+const cookieBase = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: "lax",
+};
+
+const cookies = {
+  accessName: "access_token",
+  refreshName: "refresh_token",
+  access: { ...cookieBase, path: "/", maxAge: 15 * 60 * 1000 },
+  refresh: {
+    ...cookieBase,
+    path: "/api/auth",
+    maxAge: refreshToken.ttlSeconds * 1000,
+  },
+};
+
 const rateLimit = {
   loginWindowSeconds: 15 * 60, 
   maxLoginAttempts: 5,
@@ -40,4 +59,5 @@ export {
   refreshToken,
   rateLimit,
   messages,
+  cookies
 };
