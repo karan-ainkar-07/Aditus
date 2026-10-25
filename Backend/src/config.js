@@ -1,1 +1,1 @@
-export const databaseURL ="DATABASE_URL" //change to "DIRECT_URL" for migration and "DATABASE_URL" otherwise
+export const databaseURL ="DIRECT_URL" //change to "DIRECT_URL" for migration and "DATABASE_URL" otherwise

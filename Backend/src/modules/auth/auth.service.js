@@ -1,404 +1,442 @@
 import crypto from "node:crypto";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-
-import prisma from "../../config/prisma.js";
-import redis from "../../config/redis.js";
-import twilio from "../../config/twilio.js";
-
+import { Redis } from "@upstash/redis";
+import twilio from "twilio";
+import prisma from "../../lib/prisma.js";
 import {
-  otp,
-  messages,
-  accessToken as accessCfg,
-  refreshToken as refreshCfg,
-  rateLimit,
+  ACCOUNT_STATUS,
+  ACCOUNT_TYPE,
+  SELF_REGISTER_ROLES,
+  OTP_PURPOSE,
+  OTP,
+  LOGIN,
+  PASSWORD,
+  NAME,
+  PHONE,
+  TOKEN,
+  REDIS_KEY,
 } from "./auth.config.js";
 
 export class AuthError extends Error {
-  constructor(message, statusCode = 400) {
+  constructor(status, code, message, retryAfter) {
     super(message);
-    this.name = "AuthError";
-    this.statusCode = statusCode;
+    this.status = status;
+    this.code = code;
+    this.retryAfter = retryAfter;
   }
 }
 
-const phoneHash = (phone) =>
-  crypto.createHash("sha256").update(phone).digest("hex");
+// ---------- infra ----------
 
-const otpKey = (phone) => `aditus:otp:${phoneHash(phone)}`;
-const attemptsKey = (phone) => `aditus:otp:attempts:${phoneHash(phone)}`;
-const cooldownKey = (phone) => `aditus:otp:cooldown:${phoneHash(phone)}`;
-const hourlyKey = (phone) => `aditus:otp:hourly:${phoneHash(phone)}`;
-const loginKey = (phone) => `aditus:login:${phoneHash(phone)}`;
+// raw strings back, no auto json-parsing of hashes/flags
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  automaticDeserialization: false,
+});
 
-const hashOtp = (phone, code) => {
-  const secret = process.env.OTP_HMAC_SECRET;
+let twilioClient;
+const getTwilio = () =>
+  (twilioClient ??= twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN));
 
-  if (!secret) {
-    throw new Error("OTP_HMAC_SECRET is not configured");
+async function sendSms(to, body) {
+  // no twilio creds in dev -> just print it
+  if (!process.env.TWILIO_ACCOUNT_SID && process.env.NODE_ENV !== "production") {
+    console.log(`[dev sms] ${to}: ${body}`);
+    return;
   }
-
-  return crypto
-    .createHmac("sha256", secret)
-    .update(`${phone}:${code}`)
-    .digest("hex");
-};
-
-const generateOtp = () =>
-  crypto
-    .randomInt(0, 10 ** otp.length)
-    .toString()
-    .padStart(otp.length, "0");
-
-export const sendOtpCode = async (phone) => {
-  const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-
-  if (!messagingServiceSid) {
-    throw new Error("TWILIO_MESSAGING_SERVICE_SID is not configured");
-  }
-
-  const cooldownExists = await redis.get(cooldownKey(phone));
-
-  if (cooldownExists) {
-    throw new AuthError("Please wait before requesting another OTP", 429);
-  }
-
-  const sends = await redis.incr(hourlyKey(phone));
-
-  if (sends === 1) {
-    await redis.expire(hourlyKey(phone), 3600);
-  }
-
-  if (sends > otp.maxSendsPerHour) {
-    throw new AuthError("OTP request limit reached. Try again later.", 429);
-  }
-
-  const code = generateOtp();
-  const key = otpKey(phone);
-
-  await redis.set(key, hashOtp(phone, code), { ex: otp.ttlSeconds });
-  await redis.set(cooldownKey(phone), "1", { ex: otp.resendCooldownSeconds });
-
-  try {
-    // await twilio.messages.create({
-    //   to: phone,
-    //   messagingServiceSid,
-    //   body:
-    //     `Your Aditus verification code is ${code}. ` +
-    //     `It expires in ${Math.ceil(otp.ttlSeconds / 60)} minute(s).`,
-    // });
-    console.log(`Your otp is ${code}`)
-
-  } catch (error) {
-    console.error("[twilio]", error);
-    await redis.del(key);
-    await redis.del(cooldownKey(phone));
-
-    throw new AuthError(messages.smsSendFailed, 502);
-  }
-
-  return {
-    message: messages.otpSent,
-    expiresInSeconds: otp.ttlSeconds,
-  };
-};
-
-const consumeOtp = async (phone, code) => {
-  const script = `
-    local stored = redis.call("GET", KEYS[1])
-
-    if not stored then
-      return -1
-    end
-
-    local attempts = redis.call("INCR", KEYS[2])
-
-    if attempts == 1 then
-      redis.call("EXPIRE", KEYS[2], ARGV[2])
-    end
-
-    if attempts > tonumber(ARGV[3]) then
-      redis.call("DEL", KEYS[1])
-      redis.call("DEL", KEYS[2])
-      return -2
-    end
-
-    if stored ~= ARGV[1] then
-      return 0
-    end
-
-    redis.call("DEL", KEYS[1])
-    redis.call("DEL", KEYS[2])
-    redis.call("DEL", KEYS[3])
-
-    return 1
-  `;
-
-  const result = await redis.eval(
-    script,
-    [otpKey(phone), attemptsKey(phone), cooldownKey(phone)],
-    [hashOtp(phone, code), otp.ttlSeconds, otp.maxAttempts]
-  );
-
-  if (Number(result) === 1) {
-    return true;
-  }
-
-  if (Number(result) === -2) {
-    throw new AuthError(messages.otpRateLimited, 429);
-  }
-
-  throw new AuthError(messages.invalidOtp, 400);
-};
-
-export const register = async ({ phone, password }) => {
-  const existingUser = await prisma.user.findUnique({ where: { phone } });
-
-  if (existingUser) {
-    throw new AuthError("Phone number already registered", 409);
-  }
-
-  const passwordHash = await bcrypt.hash(password, 12);
-
-  const user = await prisma.user.create({
-    data: {
-      phone,
-      passwordHash,
-      status: "PENDING_ACTIVATION",
-    },
+  await getTwilio().messages.create({
+    to,
+    messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
+    body,
   });
+}
 
-  await sendOtpCode(phone);
+const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
+const otpHash = (v) => crypto.createHmac("sha256", process.env.OTP_HMAC_SECRET).update(v).digest("hex");
 
-  return {
-    message: "Registration started. Please verify your phone.",
-    userId: user.id,
-  };
+const safeEqual = (a, b) => {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 };
 
-export const verifyOtp = async ({ phone, code }) => {
-  const user = await prisma.user.findUnique({ where: { phone } });
+// compared against when the phone is unknown, so timing doesn't leak who exists
+const DUMMY_HASH = bcrypt.hashSync("dummy-password", PASSWORD.BCRYPT_ROUNDS);
 
-  if (!user || user.status !== "PENDING_ACTIVATION") {
-    throw new AuthError(messages.invalidOtp, 400);
-  }
+// ---------- helpers ----------
 
-  await consumeOtp(phone, code);
+export function normalizePhone(raw) {
+  if (typeof raw !== "string") throw new AuthError(400, "INVALID_PHONE", "Invalid phone number");
+  let p = raw.replace(/[\s\-()]/g, "");
+  if (/^\d{10}$/.test(p)) p = PHONE.DEFAULT_COUNTRY_CODE + p;
+  if (!PHONE.E164_REGEX.test(p)) throw new AuthError(400, "INVALID_PHONE", "Invalid phone number");
+  return p;
+}
 
-  await prisma.$transaction(async (tx) => {
-    await tx.user.update({
-      where: { id: user.id },
-      data: { status: "ACTIVE" },
-    });
-
-    await tx.userRole.upsert({
-      where: {
-        userId_role: { userId: user.id, role: "PATIENT" },
-      },
-      create: { userId: user.id, role: "PATIENT" },
-      update: {},
-    });
-  });
-
-  return { message: messages.otpVerified };
-};
-
-export const resendOtp = async ({ phone }) => {
-  const user = await prisma.user.findUnique({ where: { phone } });
-
-  if (!user || user.status !== "PENDING_ACTIVATION") {
+function assertPassword(pw) {
+  if (typeof pw !== "string" || pw.length < PASSWORD.MIN_LENGTH || pw.length > PASSWORD.MAX_LENGTH) {
     throw new AuthError(
-      "If the account is eligible, a verification code can be sent.",
-      200
+      400,
+      "INVALID_PASSWORD",
+      `Password must be ${PASSWORD.MIN_LENGTH}-${PASSWORD.MAX_LENGTH} characters`
     );
   }
+}
 
-  return sendOtpCode(phone);
-};
+function assertName(name) {
+  const n = typeof name === "string" ? name.trim() : "";
+  if (n.length < NAME.MIN_LENGTH || n.length > NAME.MAX_LENGTH) {
+    throw new AuthError(400, "INVALID_NAME", "Invalid name");
+  }
+  return n;
+}
 
-// ---------- Session / token logic ----------
+function assertPurpose(purpose) {
+  if (!Object.values(OTP_PURPOSE).includes(purpose)) {
+    throw new AuthError(400, "INVALID_PURPOSE", "Invalid OTP purpose");
+  }
+}
 
-const DUMMY_HASH = bcrypt.hashSync("dummy-password", 12);
+// walk-in stub that a patient can claim by registering
+const isClaimableStub = (u) =>
+  u.accountType === ACCOUNT_TYPE.PATIENT &&
+  u.status === ACCOUNT_STATUS.PENDING_ACTIVATION &&
+  !u.passwordHash;
 
-const hashToken = (token) =>
-  crypto.createHash("sha256").update(token).digest("hex");
+// counter with a fixed window; SET NX EX first so the key always has a ttl
+async function bump(key, windowSec) {
+  const [, count] = await redis.pipeline().set(key, "0", { ex: windowSec, nx: true }).incr(key).exec();
+  return Number(count);
+}
 
-const signAccessToken = (userId) =>
-  jwt.sign({}, process.env.ACCESS_TOKEN_SECRET, {
-    subject: userId,
-    expiresIn: accessCfg.expiresIn,
+async function requireVerified(purpose, phone) {
+  const ok = await redis.get(REDIS_KEY.verified(purpose, phone));
+  if (!ok) throw new AuthError(403, "PHONE_NOT_VERIFIED", "Verify your phone number first");
+}
+
+const clearVerified = (purpose, phone) => redis.del(REDIS_KEY.verified(purpose, phone));
+
+async function issueSession(user, familyId = crypto.randomUUID(), db = prisma) {
+  const accessToken = jwt.sign({ accountType: user.accountType }, process.env.ACCESS_TOKEN_SECRET, {
+    subject: user.id,
+    expiresIn: TOKEN.ACCESS_TTL_SEC,
     algorithm: "HS256",
   });
-
-const issueRefreshToken = async (tx, { userId, familyId, meta }) => {
-  const token = crypto.randomBytes(48).toString("base64url");
-
-  const record = await tx.refreshToken.create({
+  const refreshToken = crypto.randomBytes(TOKEN.REFRESH_BYTES).toString("base64url");
+  await db.refreshToken.create({
     data: {
-      userId,
+      userId: user.id,
       familyId,
-      tokenHash: hashToken(token),
-      expiresAt: new Date(Date.now() + refreshCfg.ttlSeconds * 1000),
-      deviceInfo: meta?.userAgent ?? null,
-      ipAddress: meta?.ip ?? null,
+      tokenHash: sha256(refreshToken),
+      expiresAt: new Date(Date.now() + TOKEN.REFRESH_TTL_MS),
     },
   });
+  return { accessToken, refreshToken };
+}
 
-  return { token, record };
-};
+const revokeAllTokens = (userId, db = prisma) =>
+  db.refreshToken.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
 
-const revokeFamily = (familyId) =>
-  prisma.refreshToken.updateMany({
-    where: { familyId, revokedAt: null },
-    data: { revokedAt: new Date() },
-  });
+// ---------- OTP ----------
 
-export const login = async ({ phone, password }, meta) => {
-  const key = loginKey(phone);
-  const attempts = await redis.incr(key);
-
-  if (attempts === 1) {
-    await redis.expire(key, rateLimit.loginWindowSeconds);
+async function enforceOtpLimits(phone, purpose, ip) {
+  const cdKey = REDIS_KEY.otpCooldown(purpose, phone);
+  const got = await redis.set(cdKey, "1", { ex: OTP.RESEND_COOLDOWN_SEC, nx: true });
+  if (!got) {
+    const ttl = await redis.ttl(cdKey);
+    throw new AuthError(429, "OTP_COOLDOWN", `Wait ${ttl}s before requesting another OTP`, ttl);
   }
 
-  if (attempts > rateLimit.maxLoginAttempts) {
-    throw new AuthError(messages.otpRateLimited, 429);
+  const phoneKey = REDIS_KEY.otpPhoneCap(phone);
+  if ((await bump(phoneKey, OTP.CAP_WINDOW_SEC)) > OTP.PHONE_HOURLY_MAX) {
+    const ttl = await redis.ttl(phoneKey);
+    throw new AuthError(429, "OTP_LIMIT", "Too many OTP requests, try again later", ttl);
   }
+
+  if (ip) {
+    const ipKey = REDIS_KEY.otpIpCap(ip);
+    if ((await bump(ipKey, OTP.CAP_WINDOW_SEC)) > OTP.IP_HOURLY_MAX) {
+      const ttl = await redis.ttl(ipKey);
+      throw new AuthError(429, "OTP_LIMIT", "Too many OTP requests, try again later", ttl);
+    }
+  }
+}
+
+export async function sendOtp({ phone, purpose, ip }) {
+  phone = normalizePhone(phone);
+  assertPurpose(purpose);
+  await enforceOtpLimits(phone, purpose, ip);
 
   const user = await prisma.user.findUnique({ where: { phone } });
 
-  const valid = await bcrypt.compare(
-    password,
-    user?.passwordHash ?? DUMMY_HASH
-  );
-
-  if (!user || !valid) {
-    throw new AuthError("Invalid phone or password", 401);
+  if (purpose === OTP_PURPOSE.REGISTER && user && !isClaimableStub(user)) {
+    throw new AuthError(409, "PHONE_TAKEN", "Phone number already registered");
   }
 
-  if (user.status === "SUSPENDED") {
-    throw new AuthError("This account has been suspended", 401);
+  // reset answers the same whether or not the account exists
+  if (
+    purpose === OTP_PURPOSE.PASSWORD_RESET &&
+    (!user || !user.passwordHash || user.status !== ACCOUNT_STATUS.ACTIVE)
+  ) {
+    return { sent: true };
   }
 
-  if (user.status !== "ACTIVE") {
-    throw new AuthError("Phone number not verified", 403);
+  const otp = String(crypto.randomInt(0, 10 ** OTP.LENGTH)).padStart(OTP.LENGTH, "0");
+  const key = REDIS_KEY.otp(purpose, phone);
+  await redis
+    .multi()
+    .del(key)
+    .hset(key, { h: otpHash(`${purpose}:${phone}:${otp}`), a: 0 })
+    .expire(key, OTP.TTL_SEC)
+    .exec();
+
+  try {
+    await sendSms(phone, `Your Aditus verification code is ${otp}. It is valid for 5 minutes.`);
+  } catch (err) {
+    console.error("otp sms failed:", err.message);
+    await redis.del(key, REDIS_KEY.otpCooldown(purpose, phone));
+    throw new AuthError(502, "SMS_FAILED", "Could not send OTP, try again");
+  }
+  return { sent: true };
+}
+
+export async function verifyOtp({ phone, purpose, otp }) {
+  phone = normalizePhone(phone);
+  assertPurpose(purpose);
+  if (typeof otp !== "string" || !new RegExp(`^\\d{${OTP.LENGTH}}$`).test(otp)) {
+    throw new AuthError(400, "INVALID_OTP", "Invalid OTP");
   }
 
-  await redis.del(key);
+  const key = REDIS_KEY.otp(purpose, phone);
+  const stored = await redis.hget(key, "h");
+  if (!stored) throw new AuthError(400, "OTP_EXPIRED", "OTP expired or not requested");
 
-  const { token } = await prisma.$transaction((tx) =>
-    issueRefreshToken(tx, {
-      userId: user.id,
-      familyId: crypto.randomUUID(),
-      meta,
-    })
-  );
-
-  return {
-    user: { id: user.id },
-    accessToken: signAccessToken(user.id),
-    refreshToken: token,
-  };
-};
-
-export const refresh = async (rawToken, meta) => {
-  if (!rawToken) {
-    throw new AuthError("Refresh token required", 401);
+  const attempts = await redis.hincrby(key, "a", 1);
+  if (attempts > OTP.MAX_VERIFY_ATTEMPTS) {
+    await redis.del(key);
+    throw new AuthError(429, "OTP_ATTEMPTS", "Too many wrong attempts, request a new OTP");
   }
 
-  const stored = await prisma.refreshToken.findUnique({
-    where: { tokenHash: hashToken(rawToken) },
+  if (!safeEqual(stored, otpHash(`${purpose}:${phone}:${otp}`))) {
+    throw new AuthError(400, "OTP_INVALID", "Incorrect OTP");
+  }
+
+  await redis
+    .multi()
+    .del(key)
+    .set(REDIS_KEY.verified(purpose, phone), "1", { ex: OTP.VERIFIED_TTL_SEC })
+    .exec();
+  return { verified: true };
+}
+
+// ---------- account ----------
+
+export async function getMe(userId) {
+  const u = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      name: true,
+      phone: true,
+      accountType: true,
+      status: true,
+      membership: {
+        select: { role: true, clinic: { select: { id: true, name: true, status: true } } },
+      },
+    },
   });
+  if (!u) throw new AuthError(401, "INVALID_TOKEN", "Not authenticated");
+  const { membership: m } = u;
+  return {
+    id: u.id,
+    name: u.name,
+    phone: u.phone,
+    accountType: u.accountType,
+    status: u.status,
+    clinic: m ? { id: m.clinic.id, name: m.clinic.name, status: m.clinic.status, role: m.role } : null,
+  };
+}
 
-  if (!stored) {
-    throw new AuthError("Invalid refresh token", 401);
+export async function register({ phone, password, name, role }) {
+  phone = normalizePhone(phone);
+  const accountType = SELF_REGISTER_ROLES[role];
+  if (!accountType) throw new AuthError(400, "INVALID_ROLE", "Invalid role");
+  assertPassword(password);
+  name = assertName(name);
+  await requireVerified(OTP_PURPOSE.REGISTER, phone);
+
+  const passwordHash = await bcrypt.hash(password, PASSWORD.BCRYPT_ROUNDS);
+  const now = new Date();
+
+  let user;
+  try {
+    user = await prisma.$transaction(async (tx) => {
+      const existing = await tx.user.findUnique({ where: { phone } });
+      if (existing) {
+        // only a patient can claim a walk-in stub
+        if (accountType !== ACCOUNT_TYPE.PATIENT || !isClaimableStub(existing)) {
+          throw new AuthError(409, "PHONE_TAKEN", "Phone number already registered");
+        }
+        return tx.user.update({
+          where: { id: existing.id },
+          data: { name, passwordHash, status: ACCOUNT_STATUS.ACTIVE, phoneVerifiedAt: now },
+        });
+      }
+      return tx.user.create({
+        data: {
+          name,
+          phone,
+          passwordHash,
+          accountType,
+          status: ACCOUNT_STATUS.ACTIVE,
+          phoneVerifiedAt: now,
+          ...(accountType === ACCOUNT_TYPE.PATIENT && { patientInfo: { create: {} } }),
+        },
+      });
+    });
+  } catch (err) {
+    if (err.code === "P2002") throw new AuthError(409, "PHONE_TAKEN", "Phone number already registered");
+    throw err;
   }
 
-  // Reuse detected: revoke the whole family
-  if (stored.revokedAt) {
-    await revokeFamily(stored.familyId);
-    throw new AuthError("Invalid refresh token", 401);
+  await clearVerified(OTP_PURPOSE.REGISTER, phone);
+  const session = await issueSession(user);
+  return { ...session, user: await getMe(user.id) };
+}
+
+export async function login({ phone, password }) {
+  phone = normalizePhone(phone);
+  if (typeof password !== "string" || !password || password.length > PASSWORD.MAX_LENGTH) {
+    throw new AuthError(401, "INVALID_CREDENTIALS", "Invalid phone or password");
   }
 
-  if (stored.expiresAt <= new Date()) {
-    throw new AuthError("Invalid refresh token", 401);
+  const failKey = REDIS_KEY.loginFail(phone);
+  if ((Number(await redis.get(failKey)) || 0) >= LOGIN.MAX_FAILS) {
+    const ttl = await redis.ttl(failKey);
+    throw new AuthError(429, "LOGIN_LOCKED", "Too many attempts, try again later", ttl);
+  }
+
+  const user = await prisma.user.findUnique({ where: { phone } });
+  const match = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH);
+
+  if (!user || !user.passwordHash || !match || user.status !== ACCOUNT_STATUS.ACTIVE) {
+    await bump(failKey, LOGIN.WINDOW_SEC);
+    throw new AuthError(401, "INVALID_CREDENTIALS", "Invalid phone or password");
+  }
+
+  await redis.del(failKey);
+  const session = await issueSession(user);
+  return { ...session, user: await getMe(user.id) };
+}
+
+export async function refresh(rawToken) {
+  const fail = () => new AuthError(401, "INVALID_REFRESH", "Session expired, log in again");
+  if (!rawToken) throw fail();
+
+  const row = await prisma.refreshToken.findUnique({ where: { tokenHash: sha256(rawToken) } });
+  if (!row || row.expiresAt < new Date()) throw fail();
+
+  if (row.revokedAt) {
+    // an old token showing up again past the grace window means it leaked -> kill the family
+    if (Date.now() - row.revokedAt.getTime() > TOKEN.REFRESH_REUSE_GRACE_MS) {
+      await prisma.refreshToken.updateMany({
+        where: { familyId: row.familyId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+    }
+    throw fail();
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: row.userId } });
+  if (!user || user.status !== ACCOUNT_STATUS.ACTIVE) throw fail();
+
+  return prisma.$transaction(async (tx) => {
+    const { count } = await tx.refreshToken.updateMany({
+      where: { id: row.id, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    if (count === 0) throw fail();
+    return issueSession(user, row.familyId, tx);
+  });
+}
+
+export async function logout(rawToken) {
+  if (!rawToken) return;
+  await prisma.refreshToken.updateMany({
+    where: { tokenHash: sha256(rawToken), revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+}
+
+// resolves the access cookie to a live user; clinic status is left to authorization
+export async function authenticateToken(token) {
+  const unauth = () => new AuthError(401, "INVALID_TOKEN", "Not authenticated");
+  if (!token) throw unauth();
+
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, { algorithms: ["HS256"] });
+  } catch {
+    throw unauth();
   }
 
   const user = await prisma.user.findUnique({
-    where: { id: stored.userId },
-    select: { id: true, status: true },
+    where: { id: payload.sub },
+    select: {
+      id: true,
+      accountType: true,
+      status: true,
+      membership: { select: { clinicId: true, role: true, clinic: { select: { status: true } } } },
+    },
   });
-
-  if (!user || user.status !== "ACTIVE") {
-    await revokeFamily(stored.familyId);
-    throw new AuthError("Invalid refresh token", 401);
-  }
-
-  const next = await prisma.$transaction(async (tx) => {
-    const claimed = await tx.refreshToken.updateMany({
-      where: { id: stored.id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-
-    if (claimed.count === 0) return null; // lost a race
-
-    const issued = await issueRefreshToken(tx, {
-      userId: stored.userId,
-      familyId: stored.familyId,
-      meta,
-    });
-
-    await tx.refreshToken.update({
-      where: { id: stored.id },
-      data: { replacedById: issued.record.id },
-    });
-
-    return issued.token;
-  });
-
-  if (!next) {
-    throw new AuthError("Invalid refresh token", 401);
-  }
+  if (!user || user.status !== ACCOUNT_STATUS.ACTIVE) throw unauth();
 
   return {
-    accessToken: signAccessToken(stored.userId),
-    refreshToken: next,
+    userId: user.id,
+    accountType: user.accountType,
+    membership: user.membership
+      ? { clinicId: user.membership.clinicId, role: user.membership.role, clinicStatus: user.membership.clinic.status }
+      : null,
   };
-};
+}
 
-export const logout = async (rawToken) => {
-  if (!rawToken) return;
+export async function changePassword({ userId, currentPassword, newPassword }) {
+  assertPassword(newPassword);
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const ok =
+    user?.passwordHash &&
+    typeof currentPassword === "string" &&
+    (await bcrypt.compare(currentPassword, user.passwordHash));
+  if (!ok) throw new AuthError(400, "WRONG_PASSWORD", "Current password is incorrect");
 
-  const stored = await prisma.refreshToken.findUnique({
-    where: { tokenHash: hashToken(rawToken) },
+  const passwordHash = await bcrypt.hash(newPassword, PASSWORD.BCRYPT_ROUNDS);
+  // every device is logged out, this one gets a fresh session
+  return prisma.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: userId }, data: { passwordHash } });
+    await revokeAllTokens(userId, tx);
+    return issueSession(user, crypto.randomUUID(), tx);
+  });
+}
+
+export async function resetPassword({ phone, newPassword }) {
+  phone = normalizePhone(phone);
+  assertPassword(newPassword);
+  await requireVerified(OTP_PURPOSE.PASSWORD_RESET, phone);
+
+  const user = await prisma.user.findUnique({ where: { phone } });
+  if (!user || !user.passwordHash || user.status !== ACCOUNT_STATUS.ACTIVE) {
+    throw new AuthError(400, "RESET_NOT_ALLOWED", "Cannot reset password for this account");
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, PASSWORD.BCRYPT_ROUNDS);
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
+    await revokeAllTokens(user.id, tx);
   });
 
-  if (stored) await revokeFamily(stored.familyId);
-};
-
-export const me = async (userId) => {
-  const [user, roles, memberships] = await Promise.all([
-    prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, phone: true, status: true },
-    }),
-    prisma.userRole.findMany({
-      where: { userId },
-      select: { role: true },
-    }),
-    prisma.clinicMembership.findMany({
-      where: { userId, status: "ACTIVE" },
-      select: {
-        clinicId: true,
-        role: true,
-        clinic: { select: { status: true } },
-      },
-    }),
-  ]);
-
-  return {
-    user,
-    globalRoles: roles.map((r) => r.role),
-    memberships,
-  };
-};
+  await clearVerified(OTP_PURPOSE.PASSWORD_RESET, phone);
+  await redis.del(REDIS_KEY.loginFail(phone));
+  return { reset: true };
+}

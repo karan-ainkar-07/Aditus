@@ -1,63 +1,85 @@
-const otp = {
-  length: 6,
-  ttlSeconds: 300, 
-  maxAttempts: 5,
-  resendCooldownSeconds: 60,
-  maxSendsPerHour: 5,
+// auth constants
+
+export const AUTH_BASE_PATH = "/api/auth";
+
+export const ACCOUNT_TYPE = {
+  SYSTEM_ADMIN: "SYSTEM_ADMIN",
+  PATIENT: "PATIENT",
+  CLINIC_STAFF: "CLINIC_STAFF",
 };
 
-const password = {
-  minLength: 8,
-  maxBytes: 72,
+export const ACCOUNT_STATUS = {
+  ACTIVE: "ACTIVE",
+  PENDING_ACTIVATION: "PENDING_ACTIVATION",
+  SUSPENDED: "SUSPENDED",
 };
 
-const accessToken = {
-  expiresIn: "15m",
+export const SELF_REGISTER_ROLES = {
+  PATIENT: ACCOUNT_TYPE.PATIENT,
+  CLINIC_ADMIN: ACCOUNT_TYPE.CLINIC_STAFF,
 };
 
-const refreshToken = {
-  ttlSeconds: 30 * 24 * 60 * 60, 
+export const OTP_PURPOSE = {
+  REGISTER: "REGISTER",
+  PASSWORD_RESET: "PASSWORD_RESET",
+};
+
+export const OTP = {
+  LENGTH: 6,
+  TTL_SEC: 300,
+  MAX_VERIFY_ATTEMPTS: 5,
+  RESEND_COOLDOWN_SEC: 30,
+  CAP_WINDOW_SEC: 3600,
+  PHONE_HOURLY_MAX: 5,
+  IP_HOURLY_MAX: 20,
+  VERIFIED_TTL_SEC: 600,
+};
+
+export const LOGIN = {
+  MAX_FAILS: 10,
+  WINDOW_SEC: 900,
+};
+
+export const PASSWORD = {
+  MIN_LENGTH: 8,
+  MAX_LENGTH: 72, 
+  BCRYPT_ROUNDS: 10,
+};
+
+export const NAME = {
+  MIN_LENGTH: 2,
+  MAX_LENGTH: 100,
+};
+
+export const PHONE = {
+  DEFAULT_COUNTRY_CODE: "+91",
+  E164_REGEX: /^\+[1-9][0-9]{7,14}$/,
+};
+
+export const TOKEN = {
+  ACCESS_TTL_SEC: 15 * 60,
+  REFRESH_TTL_MS: 7 * 24 * 60 * 60 * 1000,
+  REFRESH_BYTES: 48,
+  REFRESH_REUSE_GRACE_MS: 10 * 1000,
 };
 
 const isProd = process.env.NODE_ENV === "production";
 
-const cookieBase = {
-  httpOnly: true,
-  secure: isProd,
-  sameSite: "lax",
-};
-
-const cookies = {
-  accessName: "access_token",
-  refreshName: "refresh_token",
-  access: { ...cookieBase, path: "/", maxAge: 15 * 60 * 1000 },
-  refresh: {
-    ...cookieBase,
-    path: "/api/auth",
-    maxAge: refreshToken.ttlSeconds * 1000,
+export const COOKIE = {
+  ACCESS_NAME: "access_token",
+  REFRESH_NAME: "refresh_token",
+  BASE: {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
   },
 };
 
-const rateLimit = {
-  loginWindowSeconds: 15 * 60, 
-  maxLoginAttempts: 5,
-};
-
-const messages = {
-  invalidRequest: "Invalid request data",
-  invalidOtp: "Invalid or expired OTP",
-  otpSent: "Verification code sent",
-  otpVerified: "Phone number verified successfully",
-  otpRateLimited: "Too many attempts. Please try again later.",
-  smsSendFailed: "Unable to send verification code. Please try again.",
-};
-
-export {
-  otp,
-  password,
-  accessToken,
-  refreshToken,
-  rateLimit,
-  messages,
-  cookies
+export const REDIS_KEY = {
+  otp: (purpose, phone) => `otp:${purpose}:${phone}`,
+  otpCooldown: (purpose, phone) => `otp:cd:${purpose}:${phone}`,
+  otpPhoneCap: (phone) => `otp:cap:phone:${phone}`,
+  otpIpCap: (ip) => `otp:cap:ip:${ip}`,
+  verified: (purpose, phone) => `verified:${purpose}:${phone}`,
+  loginFail: (phone) => `login:fail:${phone}`,
 };

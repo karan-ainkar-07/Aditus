@@ -1,91 +1,96 @@
-import * as authService from "./auth.service.js";
-import { cookies } from "./auth.config.js";
+import * as service from "./auth.service.js";
+import { AuthError } from "./auth.service.js";
+import { AUTH_BASE_PATH, COOKIE, TOKEN } from "./auth.config.js";
 
-const { maxAge: _a, ...clearAccess } = cookies.access;
-const { maxAge: _r, ...clearRefresh } = cookies.refresh;
-
-const meta = (req) => ({
-  userAgent: req.get("user-agent")?.slice(0, 255),
-  ip: req.ip,
-});
+const handle = (fn) => async (req, res, next) => {
+  try {
+    await fn(req, res, next);
+  } catch (err) {
+    if (err instanceof AuthError) {
+      if (err.retryAfter > 0) res.set("Retry-After", String(err.retryAfter));
+      return res.status(err.status).json({ error: { code: err.code, message: err.message } });
+    }
+    next(err);
+  }
+};
 
 const setAuthCookies = (res, { accessToken, refreshToken }) => {
-  res.cookie(cookies.accessName, accessToken, cookies.access);
-  res.cookie(cookies.refreshName, refreshToken, cookies.refresh);
+  res.cookie(COOKIE.ACCESS_NAME, accessToken, {
+    ...COOKIE.BASE,
+    path: "/",
+    maxAge: TOKEN.ACCESS_TTL_SEC * 1000,
+  });
+  // refresh cookie only travels to /api/auth/*
+  res.cookie(COOKIE.REFRESH_NAME, refreshToken, {
+    ...COOKIE.BASE,
+    path: AUTH_BASE_PATH,
+    maxAge: TOKEN.REFRESH_TTL_MS,
+  });
 };
 
 const clearAuthCookies = (res) => {
-  res.clearCookie(cookies.accessName, clearAccess);
-  res.clearCookie(cookies.refreshName, clearRefresh);
+  res.clearCookie(COOKIE.ACCESS_NAME, { ...COOKIE.BASE, path: "/" });
+  res.clearCookie(COOKIE.REFRESH_NAME, { ...COOKIE.BASE, path: AUTH_BASE_PATH });
 };
 
-export const register = async (req, res, next) => {
-  try {
-    const result = await authService.register(req.body);
-    return res.status(201).json(result);
-  } catch (error) {
-    next(error);
-  }
-};
+// attaches req.auth = { userId, accountType, membership }
+export const authenticate = handle(async (req, _res, next) => {
+  req.auth = await service.authenticateToken(req.cookies?.[COOKIE.ACCESS_NAME]);
+  next();
+});
 
-export const verifyOtp = async (req, res, next) => {
-  try {
-    const result = await authService.verifyOtp(req.body);
-    return res.status(200).json(result);
-  } catch (error) {
-    next(error);
-  }
-};
+export const sendOtp = handle(async (req, res) => {
+  const { phone, purpose } = req.body ?? {};
+  res.json(await service.sendOtp({ phone, purpose, ip: req.ip }));
+});
 
-export const resendOtp = async (req, res, next) => {
-  try {
-    const result = await authService.resendOtp(req.body);
-    return res.status(200).json(result);
-  } catch (error) {
-    next(error);
-  }
-};
+export const verifyOtp = handle(async (req, res) => {
+  const { phone, purpose, otp } = req.body ?? {};
+  res.json(await service.verifyOtp({ phone, purpose, otp }));
+});
 
-export const login = async (req, res, next) => {
-  try {
-    const { user, accessToken, refreshToken } =
-      await authService.login(req.body, meta(req));
-    setAuthCookies(res, { accessToken, refreshToken });
-    return res.status(200).json({ user });
-  } catch (error) {
-    next(error);
-  }
-};
+export const register = handle(async (req, res) => {
+  const { phone, password, name, role } = req.body ?? {};
+  const { user, ...tokens } = await service.register({ phone, password, name, role });
+  setAuthCookies(res, tokens);
+  res.status(201).json({ user });
+});
 
-export const refresh = async (req, res, next) => {
+export const login = handle(async (req, res) => {
+  const { phone, password } = req.body ?? {};
+  const { user, ...tokens } = await service.login({ phone, password });
+  setAuthCookies(res, tokens);
+  res.json({ user });
+});
+
+export const refresh = handle(async (req, res) => {
   try {
-    const tokens = await authService.refresh(
-      req.cookies?.[cookies.refreshName],
-      meta(req)
-    );
-    setAuthCookies(res, tokens);
-    return res.status(200).json({ message: "Session refreshed" });
-  } catch (error) {
+    setAuthCookies(res, await service.refresh(req.cookies?.[COOKIE.REFRESH_NAME]));
+  } catch (err) {
     clearAuthCookies(res);
-    next(error);
+    throw err;
   }
-};
+  res.json({ ok: true });
+});
 
-export const logout = async (req, res, next) => {
-  try {
-    await authService.logout(req.cookies?.[cookies.refreshName]);
-    clearAuthCookies(res);
-    return res.status(200).json({ message: "Logged out" });
-  } catch (error) {
-    next(error);
-  }
-};
+export const logout = handle(async (req, res) => {
+  await service.logout(req.cookies?.[COOKIE.REFRESH_NAME]);
+  clearAuthCookies(res);
+  res.json({ ok: true });
+});
 
-export const me = async (req, res, next) => {
-  try {
-    const result = await authService.me(req.user.id);
-    return res.status(200).json(result);
-  } catch (error) {
-    next(error);
-  }
-};
+export const me = handle(async (req, res) => {
+  res.json({ user: await service.getMe(req.auth.userId) });
+});
+
+export const changePassword = handle(async (req, res) => {
+  const { currentPassword, newPassword } = req.body ?? {};
+  const tokens = await service.changePassword({ userId: req.auth.userId, currentPassword, newPassword });
+  setAuthCookies(res, tokens);
+  res.json({ ok: true });
+});
+
+export const resetPassword = handle(async (req, res) => {
+  const { phone, newPassword } = req.body ?? {};
+  res.json(await service.resetPassword({ phone, newPassword }));
+});
